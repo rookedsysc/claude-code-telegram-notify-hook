@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -14,12 +15,77 @@ import (
 )
 
 var (
-	botToken = os.Getenv("CC_HOOK_TELEGRAM_BOT_TOKEN")
-	chatID   = os.Getenv("CC_HOOK_TELEGRAM_CHAT_ID")
+	botToken string
+	chatID   string
 )
 
 
+// cwd부터 최대 maxDepth 단계 상위 디렉토리까지 .env 파일을 탐색
+func findEnvFile(cwd string, maxDepth int) string {
+	dir := cwd
+	for i := 0; i <= maxDepth; i++ {
+		envPath := filepath.Join(dir, ".env")
+		if _, err := os.Stat(envPath); err == nil {
+			return envPath
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return ""
+}
+
+// .env 파일을 파싱하여 KEY=VALUE 맵으로 반환
+func parseEnvFile(path string) (map[string]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	envMap := make(map[string]string)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, found := strings.Cut(line, "=")
+		if !found {
+			continue
+		}
+		envMap[strings.TrimSpace(key)] = strings.TrimSpace(value)
+	}
+	return envMap, scanner.Err()
+}
+
+// cwd 기반으로 .env 파일에서 텔레그램 설정을 로드
+func loadTelegramConfig(cwd string) error {
+	envPath := findEnvFile(cwd, 2)
+	if envPath == "" {
+		return fmt.Errorf(".env file not found (searched from %s, up to 2 levels)", cwd)
+	}
+
+	envMap, err := parseEnvFile(envPath)
+	if err != nil {
+		return fmt.Errorf("failed to parse .env file %s: %w", envPath, err)
+	}
+
+	botToken = envMap["TELEGRAM_BOT_TOKEN"]
+	chatID = envMap["TELEGRAM_CHAT_ID"]
+
+	if botToken == "" || chatID == "" {
+		return fmt.Errorf("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not found in %s", envPath)
+	}
+	return nil
+}
+
 func sendTelegramMessage(message string) error {
+	if botToken == "" || chatID == "" {
+		return fmt.Errorf("telegram credentials not configured")
+	}
 	apiURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken)
 	
 	data := url.Values{}
@@ -110,7 +176,17 @@ func main() {
 		sendErrorNotification(fmt.Sprintf("JSON Decode Error: %v\nInput: %s", err, string(inputData)))
 		os.Exit(1)
 	}
-	
+
+	// stdin JSON의 cwd 기반으로 .env에서 텔레그램 설정 로드
+	cwd, _ := rawData["cwd"].(string)
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	if err := loadTelegramConfig(cwd); err != nil {
+		fmt.Fprintf(os.Stderr, "telegram config error: %v\n", err)
+		os.Exit(1)
+	}
+
 	// 메시지 포맷팅 및 전송
 	message := formatMessage(rawData)
 	if err := sendTelegramMessage(message); err != nil {
